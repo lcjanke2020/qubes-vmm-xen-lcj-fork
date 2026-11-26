@@ -1,0 +1,139 @@
+From 82d8b19d58c168d098738d089c27031953b919d3 Mon Sep 17 00:00:00 2001
+From: Claude Coder <lcj.claude.coder@pm.me>
+Date: Wed, 25 Nov 2026 13:26:37 -0500
+Subject: [PATCH] libxl: pass RDM-adjusted low memory end to QEMU
+
+When reserved device memory (RDM) conflicts with guest RAM below 4GiB,
+libxl__domain_device_construct_rdm() moves dom->lowmem_end down to the
+start of the reserved region (for HAP guests rounded down to a 2MiB
+boundary) and extends highmem_end by the same amount. The domain is
+built with that layout: RAM population, the e820 map and hvm_info (and
+hence hvmloader) all use the adjusted values.
+
+QEMU, however, isn't told. libxl passes max-ram-below-4g only when
+mmio_hole is set, and then with the value derived from mmio_hole. In all
+other cases QEMU uses its default split of 0xf0000000. It then takes RAM
+above 4GiB to end lower than it does in the guest, by the amount the
+split was moved. For a guest with less RAM than 0xf0000000, QEMU assumes
+no RAM above 4GiB at all, while the guest has everything beyond the
+adjusted split there.
+
+Observed with an RDM region at 0x8c5b8000 and a 16384MiB HAP guest
+(split moved from 0xf0000000 to 0x8c400000):
+ - With an emulated VGA (16MiB of video RAM, leaving 16368MiB), guest
+   RAM ends at 0x472c00000 while QEMU assumes 0x40f000000. The 16MiB at
+   0x40f000000, which the guest's memory map reports as usable RAM,
+   cannot be mapped, and the guest suffers memory corruption. This is
+   consistent with QEMU placing the video RAM right after what it takes
+   to be the end of RAM, and that range losing its backing when the
+   framebuffer is moved to its BAR.
+ - Without an emulated VGA, guest RAM ends at 0x473c00000 while QEMU
+   assumes 0x410000000. There is no such hole, but of the guest pages
+   given as the target of a string read from an emulated I/O port, those
+   below 0x410000000 received the data and those from there up did not.
+
+Record the adjusted low memory end in the domain build state and hand it
+to QEMU as max-ram-below-4g. If the RDM step did not move the split, the
+device model command line is unchanged. If it did, the recorded value is
+used instead of the one derived from mmio_hole: the RDM step starts from
+the mmio_hole split and only ever lowers it. The validity check of
+mmio_hole and its warning stay as they are.
+
+The build state is filled in on a fresh domain build only. Restore,
+migration and soft reset don't run the RDM step, so a device model
+started on one of those paths still gets the default split (or the
+mmio_hole one), for a guest which keeps the layout it was built with.
+This patch doesn't change that.
+
+Fixes: 25652f232cbe ("tools/libxl: detect and avoid conflicts with RDM")
+Assisted-by: Claude Code:claude-fable-5-2
+---
+ tools/libs/light/libxl_create.c   |  1 +
+ tools/libs/light/libxl_dm.c       | 11 ++++++++++-
+ tools/libs/light/libxl_dom.c      | 12 ++++++++++++
+ tools/libs/light/libxl_internal.h |  8 ++++++++
+ 4 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/tools/libs/light/libxl_create.c b/tools/libs/light/libxl_create.c
+index a3a1e99ace..c17dc9e66a 100644
+--- a/tools/libs/light/libxl_create.c
++++ b/tools/libs/light/libxl_create.c
+@@ -1034,6 +1034,7 @@ static int store_libxl_entry(libxl__gc *gc, uint32_t domid,
+ void libxl__domain_build_state_init(libxl__domain_build_state *state)
+ {
+     state->dm_monitor_fd = -1;
++    state->rdm_lowmem_end = 0;
+ }
+ 
+ void libxl__domain_build_state_dispose(libxl__domain_build_state *state)
+diff --git a/tools/libs/light/libxl_dm.c b/tools/libs/light/libxl_dm.c
+index af96dcae5f..7b64799065 100644
+--- a/tools/libs/light/libxl_dm.c
++++ b/tools/libs/light/libxl_dm.c
+@@ -1821,11 +1821,20 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
+                 LOGD(WARN, guest_domid, "mmio_hole_memkb=%"PRIu64
+                      " invalid ignored.\n",
+                     b_info->u.hvm.mmio_hole_memkb);
+-            } else {
++            } else if (!state->rdm_lowmem_end) {
+                 machinearg = GCSPRINTF("%s,max-ram-below-4g=%"PRIu64,
+                                             machinearg, max_ram_below_4g);
+             }
+         }
++        if (state->rdm_lowmem_end) {
++            /*
++             * The domain was built with the end of low RAM moved below
++             * reserved device memory.  That is lower than the default
++             * split, and lower than what mmio_hole asked for (if set).
++             */
++            machinearg = GCSPRINTF("%s,max-ram-below-4g=%"PRIu64,
++                                   machinearg, state->rdm_lowmem_end);
++        }
+ 
+         if (libxl_defbool_val(b_info->u.hvm.gfx_passthru)) {
+             switch (b_info->u.hvm.gfx_passthru_kind) {
+diff --git a/tools/libs/light/libxl_dom.c b/tools/libs/light/libxl_dom.c
+index 94fef37401..7f29df5e9e 100644
+--- a/tools/libs/light/libxl_dom.c
++++ b/tools/libs/light/libxl_dom.c
+@@ -1152,6 +1152,18 @@ int libxl__build_hvm(libxl__gc *gc, uint32_t domid,
+         goto out;
+     }
+ 
++    /*
++     * Resolving a conflict with reserved device memory may have lowered
++     * the end of RAM below 4GiB.  Record the result, for the device model
++     * to be given the same split.
++     */
++    if (dom->lowmem_end != lowmem_end) {
++        state->rdm_lowmem_end = dom->lowmem_end;
++        LOGD(DEBUG, domid,
++             "RDM: end of low RAM moved from 0x%"PRIx64" to 0x%"PRIx64,
++             lowmem_end, state->rdm_lowmem_end);
++    }
++
+     if (info->num_vnuma_nodes != 0) {
+         int i;
+ 
+diff --git a/tools/libs/light/libxl_internal.h b/tools/libs/light/libxl_internal.h
+index 532c42cda8..7f292242e0 100644
+--- a/tools/libs/light/libxl_internal.h
++++ b/tools/libs/light/libxl_internal.h
+@@ -1395,6 +1395,14 @@ typedef struct {
+     xen_vmemrange_t *vmemranges;
+     uint32_t num_vmemranges;
+ 
++    /*
++     * End of RAM below 4GiB, if it had to be lowered to keep guest RAM
++     * clear of reserved device memory; zero otherwise.  hvmloader learns
++     * the resulting layout from hvm_info, but the device model has to be
++     * told explicitly.
++     */
++    uint64_t rdm_lowmem_end;
++
+     xen_pfn_t vuart_gfn;
+     evtchn_port_t vuart_port;
+ 
+-- 
+2.56.1
+
